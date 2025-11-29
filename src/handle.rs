@@ -1,5 +1,5 @@
 use core::fmt;
-use std::alloc::{alloc_zeroed, Layout};
+use std::alloc::{Layout, alloc_zeroed};
 use std::hash::Hash;
 use std::marker::PhantomData;
 use std::ops::{Index, IndexMut};
@@ -32,7 +32,11 @@ pub struct Handle<T: ?Sized> {
 
 impl<T> fmt::Debug for Handle<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Handle").field("slot", &self.slot).field("generation", &self.generation).field("phantom", &self.phantom).finish()
+        f.debug_struct("Handle")
+            .field("slot", &self.slot)
+            .field("generation", &self.generation)
+            .field("phantom", &self.phantom)
+            .finish()
     }
 }
 
@@ -53,7 +57,11 @@ impl<T> Handle<T> {
     /// intended to be used by `Pool` internals; constructing handles with
     /// arbitrary values may yield dangling references.
     pub fn new(slot: u16, generation: u16) -> Self {
-        Self { slot, generation, phantom: PhantomData }
+        Self {
+            slot,
+            generation,
+            phantom: PhantomData,
+        }
     }
 }
 
@@ -82,7 +90,11 @@ impl<T> Hash for Handle<T> {
 
 impl<T> Default for Handle<T> {
     fn default() -> Self {
-        Self { slot: std::u16::MAX, generation: std::u16::MAX, phantom: PhantomData }
+        Self {
+            slot: std::u16::MAX,
+            generation: std::u16::MAX,
+            phantom: PhantomData,
+        }
     }
 }
 
@@ -361,6 +373,24 @@ impl<T> Pool<T> {
         return None;
     }
 
+    /// Inserts an item into the pool, returning a [`Handle`] if
+    /// successful.
+    ///
+    /// The pool will automatically expand if full.
+    pub fn insert_at(&mut self, item: T, slot: usize) -> Option<Handle<T>> {
+        if let Some(idx) = self.empty.iter().position(|a| *a == slot as u32) {
+            self.items[slot as usize] = item;
+            self.empty.remove(idx);
+            assert!(!self.generation.is_empty());
+            return Some(Handle {
+                slot: slot as u16,
+                generation: self.generation[slot as usize],
+                phantom: PhantomData,
+            });
+        }
+        return None;
+    }
+
     /// Grows the pool by `amount` additional slots.
     pub fn expand(&mut self, amount: usize) {
         let old_len = self.items.len();
@@ -412,6 +442,16 @@ impl<T> Pool<T> {
                 };
                 func(h);
             }
+        }
+    }
+
+    /// Calls `func` for each occupied item reference.
+    pub fn for_each_unoccupied<F>(&self, mut func: F)
+    where
+        F: FnMut(&T, usize),
+    {
+        for (iota, i) in self.empty.iter().enumerate() {
+            func(&self.items[*i as usize], iota);
         }
     }
 
