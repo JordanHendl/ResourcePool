@@ -646,6 +646,7 @@ pub struct Pool<T> {
     items: ItemList<T>,
     empty: Vec<u32>,
     generation: Vec<u16>,
+    occupied: Vec<bool>,
 }
 
 impl<T> Default for Pool<T> {
@@ -655,6 +656,7 @@ impl<T> Default for Pool<T> {
             items: ItemList::new(INITIAL_SIZE as u32),
             empty: Vec::with_capacity(INITIAL_SIZE),
             generation: vec![0; INITIAL_SIZE],
+            occupied: vec![false; INITIAL_SIZE],
         };
 
         p.empty = (0..(INITIAL_SIZE) as u32).collect();
@@ -669,6 +671,7 @@ impl<T> Pool<T> {
             items: ItemList::new(initial_size as u32),
             empty: Vec::with_capacity(initial_size),
             generation: vec![0; initial_size],
+            occupied: vec![false; initial_size],
         };
 
         assert!(!p.generation.is_empty());
@@ -687,6 +690,7 @@ impl<T> Pool<T> {
             items: ItemList::new_from_prealloc(ptr as *mut u8, len as u32),
             empty: Vec::with_capacity(len),
             generation: vec![0; len],
+            occupied: vec![false; len],
         };
 
         p.empty = (0..(len) as u32).collect();
@@ -706,7 +710,7 @@ impl<T> Pool<T> {
         const DEFAULT_EXPAND_AMT: usize = 1024;
         if let Some(empty_slot) = self.empty.pop() {
             self.items[empty_slot as usize] = item;
-
+            self.occupied[empty_slot as usize] = true;
             assert!(!self.generation.is_empty());
             return Some(Handle {
                 slot: empty_slot as u16,
@@ -717,6 +721,7 @@ impl<T> Pool<T> {
             self.expand(DEFAULT_EXPAND_AMT);
             if let Some(empty_slot) = self.empty.pop() {
                 self.items[empty_slot as usize] = item;
+                self.occupied[empty_slot as usize] = true;
 
                 assert!(!self.generation.is_empty());
                 return Some(Handle {
@@ -738,6 +743,7 @@ impl<T> Pool<T> {
             self.items[slot as usize] = item;
             self.empty.remove(idx);
             assert!(!self.generation.is_empty());
+            self.occupied[idx as usize] = true;
             return Some(Handle {
                 slot: slot as u16,
                 generation: self.generation[slot as usize],
@@ -753,6 +759,7 @@ impl<T> Pool<T> {
         self.items.expand(amount);
 
         if self.items.len() > old_len {
+            self.occupied.resize_with(self.items.len(), || false);
             self.generation.resize_with(self.items.len(), || 0);
             for i in old_len..(self.items.len()) {
                 self.empty.push(i as u32);
@@ -770,15 +777,13 @@ impl<T> Pool<T> {
     where
         F: Fn(Handle<T>),
     {
-        for (i, _) in self.items.iter().enumerate() {
-            let c = i as u32;
-            if !self.empty.contains(&c) {
-                let h = Handle::<T> {
+        for (i, &is_occupied) in self.occupied.iter().enumerate() {
+            if is_occupied {
+                func(Handle {
                     slot: i as u16,
                     generation: self.generation[i],
-                    phantom: Default::default(),
-                };
-                func(h);
+                    phantom: PhantomData,
+                });
             }
         }
     }
@@ -788,15 +793,13 @@ impl<T> Pool<T> {
     where
         F: FnMut(Handle<T>),
     {
-        for (i, _) in self.items.iter().enumerate() {
-            let c = i as u32;
-            if !self.empty.contains(&c) {
-                let h = Handle::<T> {
+        for (i, &is_occupied) in self.occupied.iter().enumerate() {
+            if is_occupied {
+                func(Handle {
                     slot: i as u16,
                     generation: self.generation[i],
-                    phantom: Default::default(),
-                };
-                func(h);
+                    phantom: PhantomData,
+                });
             }
         }
     }
@@ -816,9 +819,8 @@ impl<T> Pool<T> {
     where
         F: FnMut(&T),
     {
-        for (i, item) in self.items.iter().enumerate() {
-            let c = i as u32;
-            if !self.empty.contains(&c) {
+        for (item, &is_occupied) in self.items.iter().zip(self.occupied.iter()) {
+            if is_occupied {
                 func(item);
             }
         }
@@ -829,9 +831,8 @@ impl<T> Pool<T> {
     where
         F: FnMut(&mut T),
     {
-        for (i, item) in self.items.iter_mut().enumerate() {
-            let c = i as u32;
-            if !self.empty.contains(&c) {
+        for (item, &is_occupied) in self.items.iter_mut().zip(self.occupied.iter()) {
+            if is_occupied {
                 func(item);
             }
         }
@@ -841,6 +842,7 @@ impl<T> Pool<T> {
     pub fn release(&mut self, item: Handle<T>) {
         self.empty.push(item.slot as u32);
         self.generation[item.slot as usize] += 1;
+        self.occupied[item.slot as usize] = false;
     }
 
     /// Returns an immutable reference to the item associated with `item`.
@@ -872,6 +874,7 @@ impl<T> Pool<T> {
     pub fn clear(&mut self) {
         self.empty = (0..(self.items.len()) as u32).collect();
         self.generation.fill(0);
+        self.occupied.fill(false);
         assert!(!self.generation.is_empty());
     }
 }
