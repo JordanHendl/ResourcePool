@@ -3,6 +3,7 @@ use std::alloc::{Layout, alloc_zeroed};
 use std::hash::Hash;
 use std::marker::PhantomData;
 use std::ops::{Index, IndexMut};
+use std::sync::Mutex;
 
 use bytemuck::{Pod, Zeroable};
 
@@ -145,6 +146,12 @@ impl DynamicItemList {
         debug_assert!(std::mem::size_of::<T>() == self.item_size);
         let ptr = unsafe { (self.items as *mut T).offset(idx as isize) };
         unsafe { &mut *ptr }
+    }
+
+    unsafe fn at_mut_unchecked<T>(&self, idx: usize) -> &mut T {
+        debug_assert!(std::mem::size_of::<T>() == self.item_size);
+        let ptr = (self.items as *mut T).offset(idx as isize);
+        &mut *ptr
     }
 
     fn as_slice<T>(&self) -> &[T] {
@@ -294,6 +301,11 @@ impl<T> ItemList<T> {
             curr: 0,
         }
     }
+
+    unsafe fn at_mut_unchecked(&self, idx: usize) -> &mut T {
+        let ptr = self.items.offset(idx as isize);
+        &mut *ptr
+    }
 }
 
 impl<T> IndexMut<usize> for ItemList<T> {
@@ -381,6 +393,7 @@ pub struct DynamicPool {
     items: DynamicItemList,
     empty: Vec<u32>,
     generation: Vec<u16>,
+    locks: Vec<Mutex<()>>,
 }
 
 impl Default for DynamicPool {
@@ -390,6 +403,7 @@ impl Default for DynamicPool {
             items: DynamicItemList::new(INITIAL_SIZE as u32, 1, 1),
             empty: Vec::with_capacity(INITIAL_SIZE),
             generation: vec![0; INITIAL_SIZE],
+            locks: (0..INITIAL_SIZE).map(|_| Mutex::new(())).collect(),
         };
 
         p.empty = (0..(INITIAL_SIZE) as u32).collect();
@@ -408,6 +422,7 @@ impl DynamicPool {
             ),
             empty: Vec::with_capacity(initial_size),
             generation: vec![0; initial_size],
+            locks: (0..initial_size).map(|_| Mutex::new(())).collect(),
         };
 
         assert!(!p.generation.is_empty());
@@ -431,6 +446,7 @@ impl DynamicPool {
             ),
             empty: Vec::with_capacity(len),
             generation: vec![0; len],
+            locks: (0..len).map(|_| Mutex::new(())).collect(),
         };
 
         p.empty = (0..(len) as u32).collect();
@@ -498,6 +514,8 @@ impl DynamicPool {
 
         if self.items.len() > old_len {
             self.generation.resize_with(self.items.len(), || 0);
+            self.locks
+                .resize_with(self.items.len(), || Mutex::new(()));
             for i in old_len..(self.items.len()) {
                 self.empty.push(i as u32);
             }
@@ -605,6 +623,7 @@ impl DynamicPool {
     }
 
     /// Returns a mutable reference to the item associated with `item`.
+    #[deprecated(note = "use with_mut to avoid &mut escaping synchronization")]
     pub fn get_mut_ref<T>(&mut self, item: Handle<T>) -> Option<&mut T> {
         debug_assert!(std::mem::size_of::<T>() == self.items.item_size);
         debug_assert!(std::mem::align_of::<T>() == self.items.item_align);
@@ -613,6 +632,26 @@ impl DynamicPool {
         let slot = item.slot as usize;
         if self.generation[slot] == item.generation {
             return Some(self.items.at_mut::<T>(slot as usize));
+        } else {
+            None
+        }
+    }
+
+    /// Calls `f` with a mutable reference to the item associated with `item`.
+    pub fn with_mut<T, R>(&self, item: Handle<T>, f: impl FnOnce(&mut T) -> R) -> Option<R> {
+        debug_assert!(std::mem::size_of::<T>() == self.items.item_size);
+        debug_assert!(std::mem::align_of::<T>() == self.items.item_align);
+        assert!(item.valid());
+        assert!(!self.generation.is_empty());
+        let slot = item.slot as usize;
+        if self.generation.get(slot)? != &item.generation {
+            return None;
+        }
+        let _guard = self.locks.get(slot)?.lock().ok()?;
+        if self.generation[slot] == item.generation {
+            // Safety: the per-slot lock guarantees exclusive access to this slot.
+            let item_ref = unsafe { self.items.at_mut_unchecked::<T>(slot) };
+            return Some(f(item_ref));
         } else {
             None
         }
@@ -647,6 +686,7 @@ pub struct Pool<T> {
     empty: Vec<u32>,
     generation: Vec<u16>,
     occupied: Vec<bool>,
+    locks: Vec<Mutex<()>>,
 }
 
 impl<T> Default for Pool<T> {
@@ -657,6 +697,7 @@ impl<T> Default for Pool<T> {
             empty: Vec::with_capacity(INITIAL_SIZE),
             generation: vec![0; INITIAL_SIZE],
             occupied: vec![false; INITIAL_SIZE],
+            locks: (0..INITIAL_SIZE).map(|_| Mutex::new(())).collect(),
         };
 
         p.empty = (0..(INITIAL_SIZE) as u32).collect();
@@ -672,6 +713,7 @@ impl<T> Pool<T> {
             empty: Vec::with_capacity(initial_size),
             generation: vec![0; initial_size],
             occupied: vec![false; initial_size],
+            locks: (0..initial_size).map(|_| Mutex::new(())).collect(),
         };
 
         assert!(!p.generation.is_empty());
@@ -691,6 +733,7 @@ impl<T> Pool<T> {
             empty: Vec::with_capacity(len),
             generation: vec![0; len],
             occupied: vec![false; len],
+            locks: (0..len).map(|_| Mutex::new(())).collect(),
         };
 
         p.empty = (0..(len) as u32).collect();
@@ -761,6 +804,8 @@ impl<T> Pool<T> {
         if self.items.len() > old_len {
             self.occupied.resize_with(self.items.len(), || false);
             self.generation.resize_with(self.items.len(), || 0);
+            self.locks
+                .resize_with(self.items.len(), || Mutex::new(()));
             for i in old_len..(self.items.len()) {
                 self.empty.push(i as u32);
             }
@@ -859,12 +904,31 @@ impl<T> Pool<T> {
     }
 
     /// Returns a mutable reference to the item associated with `item`.
+    #[deprecated(note = "use with_mut to avoid &mut escaping synchronization")]
     pub fn get_mut_ref(&mut self, item: Handle<T>) -> Option<&mut T> {
         assert!(item.valid());
         assert!(!self.generation.is_empty());
         let slot = item.slot as usize;
         if self.generation[slot] == item.generation {
             return Some(&mut self.items[slot as usize]);
+        } else {
+            None
+        }
+    }
+
+    /// Calls `f` with a mutable reference to the item associated with `item`.
+    pub fn with_mut<R>(&self, item: Handle<T>, f: impl FnOnce(&mut T) -> R) -> Option<R> {
+        assert!(item.valid());
+        assert!(!self.generation.is_empty());
+        let slot = item.slot as usize;
+        if self.generation.get(slot)? != &item.generation {
+            return None;
+        }
+        let _guard = self.locks.get(slot)?.lock().ok()?;
+        if self.generation[slot] == item.generation {
+            // Safety: the per-slot lock guarantees exclusive access to this slot.
+            let item_ref = unsafe { self.items.at_mut_unchecked(slot) };
+            return Some(f(item_ref));
         } else {
             None
         }

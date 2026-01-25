@@ -47,8 +47,13 @@ impl<T> ResourceList<T> {
         self.pool.get_ref(h).unwrap()
     }
 
+    #[deprecated(note = "use with_mut to avoid &mut escaping synchronization")]
     pub fn get_ref_mut(&mut self, h: Handle<T>) -> &mut T {
         self.pool.get_mut_ref(h).unwrap()
+    }
+
+    pub fn with_mut<R>(&self, h: Handle<T>, f: impl FnOnce(&mut T) -> R) -> Option<R> {
+        self.pool.with_mut(h, f)
     }
 
     #[allow(dead_code)]
@@ -72,13 +77,14 @@ impl<T> ResourceList<T> {
     }
 
     #[allow(dead_code)]
-    pub fn for_each_occupied_mut<F>(&mut self, mut func: F)
+    pub fn for_each_occupied_mut<F>(&self, mut func: F)
     where
-        F: FnMut(&T),
+        F: FnMut(&mut T),
     {
         for item in &self.entries {
-            let r = self.pool.get_mut_ref(item.clone()).unwrap();
-            func(r);
+            let _ = self.pool.with_mut(*item, |r| {
+                func(r);
+            });
         }
     }
 }
