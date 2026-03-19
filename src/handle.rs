@@ -1,8 +1,11 @@
+
+
 use core::fmt;
-use std::alloc::{Layout, alloc_zeroed};
+use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::hash::Hash;
 use std::marker::PhantomData;
 use std::ops::{Index, IndexMut};
+use std::ptr;
 use std::sync::Mutex;
 
 use bytemuck::{Pod, Zeroable};
@@ -170,19 +173,20 @@ impl DynamicItemList {
 
     fn expand(&mut self, amt: usize) {
         if !self.imported {
-            let len = self.len() + amt;
+            let old_len = self.len();
+            let len = old_len + amt;
             unsafe {
-                let byte_size = len as usize * self.item_size;
-                let layout = Layout::from_size_align(byte_size, self.item_align).unwrap();
-                let ptr = alloc_zeroed(layout);
+                let old_byte_size = old_len * self.item_size;
+                let old_layout = Layout::from_size_align(old_byte_size, self.item_align).unwrap();
+                let new_byte_size = len * self.item_size;
+                let new_layout = Layout::from_size_align(new_byte_size, self.item_align).unwrap();
+                let ptr = alloc_zeroed(new_layout);
 
-                let src = std::slice::from_raw_parts(self.items as *const u8, self.byte_size());
-                let dst = std::slice::from_raw_parts_mut(ptr, byte_size);
+                ptr::copy_nonoverlapping(self.items as *const u8, ptr, old_byte_size);
+                dealloc(self.items, old_layout);
 
-                dst[0..src.len()].copy_from_slice(src);
-
-                self.items = ptr as *mut u8;
-                self.end = self.items.offset(len as isize * self.item_size as isize);
+                self.items = ptr;
+                self.end = self.items.add(new_byte_size);
             }
         }
     }
@@ -260,19 +264,22 @@ impl<T> ItemList<T> {
 
     fn expand(&mut self, amt: usize) {
         if !self.imported {
-            let len = self.len() + amt;
+            let old_len = self.len();
+            let len = old_len + amt;
             unsafe {
-                let byte_size = len as usize * std::mem::size_of::<T>();
-                let layout = Layout::from_size_align(byte_size, 1).unwrap();
-                let ptr = alloc_zeroed(layout);
+                let old_byte_size = old_len * std::mem::size_of::<T>();
+                let old_layout =
+                    Layout::from_size_align(old_byte_size, std::mem::align_of::<T>()).unwrap();
+                let new_byte_size = len * std::mem::size_of::<T>();
+                let new_layout =
+                    Layout::from_size_align(new_byte_size, std::mem::align_of::<T>()).unwrap();
+                let ptr = alloc_zeroed(new_layout);
 
-                let src = std::slice::from_raw_parts(self.items as *const u8, self.byte_size());
-                let dst = std::slice::from_raw_parts_mut(ptr, byte_size);
-
-                dst[0..src.len()].copy_from_slice(src);
+                ptr::copy_nonoverlapping(self.items as *const u8, ptr, old_byte_size);
+                dealloc(self.items as *mut u8, old_layout);
 
                 self.items = ptr as *mut T;
-                self.end = self.items.offset(len as isize);
+                self.end = self.items.add(len);
             }
         }
     }
@@ -465,23 +472,31 @@ impl DynamicPool {
     pub fn insert<T>(&mut self, item: T) -> Option<Handle<T>> {
         const DEFAULT_EXPAND_AMT: usize = 1024;
         if let Some(empty_slot) = self.empty.pop() {
-            *self.items.at_mut::<T>(empty_slot as usize) = item;
+            let slot = empty_slot as usize;
+            unsafe {
+                let ptr = self.items.items.add(slot * self.items.item_size) as *mut T;
+                ptr::write(ptr, item);
+            }
 
             assert!(!self.generation.is_empty());
             return Some(Handle {
                 slot: empty_slot as u16,
-                generation: self.generation[empty_slot as usize],
+                generation: self.generation[slot],
                 phantom: PhantomData,
             });
         } else {
             self.expand(DEFAULT_EXPAND_AMT);
             if let Some(empty_slot) = self.empty.pop() {
-                *self.items.at_mut::<T>(empty_slot as usize) = item;
+                let slot = empty_slot as usize;
+                unsafe {
+                    let ptr = self.items.items.add(slot * self.items.item_size) as *mut T;
+                    ptr::write(ptr, item);
+                }
 
                 assert!(!self.generation.is_empty());
                 return Some(Handle {
                     slot: empty_slot as u16,
-                    generation: self.generation[empty_slot as usize],
+                    generation: self.generation[slot],
                     phantom: PhantomData,
                 });
             }
@@ -495,12 +510,15 @@ impl DynamicPool {
     /// The pool will automatically expand if full.
     pub fn insert_at<T>(&mut self, item: T, slot: usize) -> Option<Handle<T>> {
         if let Some(idx) = self.empty.iter().position(|a| *a == slot as u32) {
-            *self.items.at_mut::<T>(slot as usize) = item;
+            unsafe {
+                let ptr = self.items.items.add(slot * self.items.item_size) as *mut T;
+                ptr::write(ptr, item);
+            }
             self.empty.remove(idx);
             assert!(!self.generation.is_empty());
             return Some(Handle {
                 slot: slot as u16,
-                generation: self.generation[slot as usize],
+                generation: self.generation[slot],
                 phantom: PhantomData,
             });
         }
@@ -603,8 +621,16 @@ impl DynamicPool {
     pub fn release<T>(&mut self, item: Handle<T>) {
         debug_assert!(std::mem::align_of::<T>() == self.items.item_align);
         debug_assert!(std::mem::size_of::<T>() == self.items.item_size);
+        let slot = item.slot as usize;
+        if self.generation.get(slot) != Some(&item.generation) {
+            return;
+        }
+        unsafe {
+            let ptr = self.items.items.add(slot * self.items.item_size) as *mut T;
+            ptr::drop_in_place(ptr);
+        }
         self.empty.push(item.slot as u32);
-        self.generation[item.slot as usize] += 1;
+        self.generation[slot] += 1;
     }
 
     /// Returns an immutable reference to the item associated with `item`.
@@ -752,24 +778,30 @@ impl<T> Pool<T> {
     pub fn insert(&mut self, item: T) -> Option<Handle<T>> {
         const DEFAULT_EXPAND_AMT: usize = 1024;
         if let Some(empty_slot) = self.empty.pop() {
-            self.items[empty_slot as usize] = item;
-            self.occupied[empty_slot as usize] = true;
+            let slot = empty_slot as usize;
+            unsafe {
+                ptr::write(self.items.items.add(slot), item);
+            }
+            self.occupied[slot] = true;
             assert!(!self.generation.is_empty());
             return Some(Handle {
                 slot: empty_slot as u16,
-                generation: self.generation[empty_slot as usize],
+                generation: self.generation[slot],
                 phantom: PhantomData,
             });
         } else {
             self.expand(DEFAULT_EXPAND_AMT);
             if let Some(empty_slot) = self.empty.pop() {
-                self.items[empty_slot as usize] = item;
-                self.occupied[empty_slot as usize] = true;
+                let slot = empty_slot as usize;
+                unsafe {
+                    ptr::write(self.items.items.add(slot), item);
+                }
+                self.occupied[slot] = true;
 
                 assert!(!self.generation.is_empty());
                 return Some(Handle {
                     slot: empty_slot as u16,
-                    generation: self.generation[empty_slot as usize],
+                    generation: self.generation[slot],
                     phantom: PhantomData,
                 });
             }
@@ -783,13 +815,15 @@ impl<T> Pool<T> {
     /// The pool will automatically expand if full.
     pub fn insert_at(&mut self, item: T, slot: usize) -> Option<Handle<T>> {
         if let Some(idx) = self.empty.iter().position(|a| *a == slot as u32) {
-            self.items[slot as usize] = item;
+            unsafe {
+                ptr::write(self.items.items.add(slot), item);
+            }
             self.empty.remove(idx);
             assert!(!self.generation.is_empty());
-            self.occupied[idx as usize] = true;
+            self.occupied[slot] = true;
             return Some(Handle {
                 slot: slot as u16,
-                generation: self.generation[slot as usize],
+                generation: self.generation[slot],
                 phantom: PhantomData,
             });
         }
@@ -885,9 +919,18 @@ impl<T> Pool<T> {
 
     /// Releases a handle, making its slot available for reuse.
     pub fn release(&mut self, item: Handle<T>) {
+        let slot = item.slot as usize;
+        if self.generation.get(slot) != Some(&item.generation)
+            || !self.occupied.get(slot).copied().unwrap_or(false)
+        {
+            return;
+        }
+        unsafe {
+            ptr::drop_in_place(self.items.items.add(slot));
+        }
         self.empty.push(item.slot as u32);
-        self.generation[item.slot as usize] += 1;
-        self.occupied[item.slot as usize] = false;
+        self.generation[slot] += 1;
+        self.occupied[slot] = false;
     }
 
     /// Returns an immutable reference to the item associated with `item`.
@@ -895,9 +938,9 @@ impl<T> Pool<T> {
         assert!(item.valid());
         assert!(self.items.len() != 0);
         assert!(!self.generation.is_empty());
-        let slot = item.slot as u32;
-        if self.generation[slot as usize] == item.generation {
-            return Some(&self.items[slot as usize]);
+        let slot = item.slot as usize;
+        if self.generation[slot] == item.generation && self.occupied[slot] {
+            return Some(&self.items[slot]);
         } else {
             None
         }
@@ -909,8 +952,8 @@ impl<T> Pool<T> {
         assert!(item.valid());
         assert!(!self.generation.is_empty());
         let slot = item.slot as usize;
-        if self.generation[slot] == item.generation {
-            return Some(&mut self.items[slot as usize]);
+        if self.generation[slot] == item.generation && self.occupied[slot] {
+            return Some(&mut self.items[slot]);
         } else {
             None
         }
@@ -936,9 +979,16 @@ impl<T> Pool<T> {
 
     /// Clears all entries and resets generation counters.
     pub fn clear(&mut self) {
+        for (slot, occupied) in self.occupied.iter_mut().enumerate() {
+            if *occupied {
+                unsafe {
+                    ptr::drop_in_place(self.items.items.add(slot));
+                }
+                *occupied = false;
+            }
+        }
         self.empty = (0..(self.items.len()) as u32).collect();
         self.generation.fill(0);
-        self.occupied.fill(false);
         assert!(!self.generation.is_empty());
     }
 }
@@ -1006,7 +1056,7 @@ mod tests {
 
     #[test]
     fn dynamic_pool_preallocated_cannot_auto_expand() {
-        use std::alloc::{Layout, alloc_zeroed};
+        use std::alloc::{Layout, alloc_zeroed, dealloc};
         use std::mem::{align_of, size_of};
 
         const N: usize = 8;
@@ -1225,6 +1275,17 @@ mod tests {
 
     #[test]
     #[serial]
+    fn pool_handles_non_pod_values() {
+        let mut pool: Pool<String> = Pool::new(1);
+        let handle = pool.insert(String::from("hello")).expect("insert should succeed");
+        assert_eq!(pool.get_ref(handle).map(String::as_str), Some("hello"));
+        pool.release(handle);
+        let handle = pool.insert(String::from("world")).expect("reinsert should succeed");
+        assert_eq!(pool.get_ref(handle).map(String::as_str), Some("world"));
+    }
+
+    #[test]
+    #[serial]
     fn test_pool_imported() {
         const TEST_AMT: usize = 2048;
         #[derive(Default)]
@@ -1250,3 +1311,5 @@ mod tests {
         assert!(pool.items.len() == TEST_AMT);
     }
 }
+
+
